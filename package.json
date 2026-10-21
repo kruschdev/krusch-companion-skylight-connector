@@ -1,0 +1,53 @@
+{
+  "name": "@krusch/companion-skylight-connector",
+  "version": "0.3.0",
+  "description": "Universal opt-in connector & MCP server bridging Krusch Companion, OpenClaw, Hermes Agent, and any AI agent with Skylight Calendar 2.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./universal": "./src/universal-adapter.js",
+    "./mcp": "./src/universal-adapter.js"
+  },
+  "bin": {
+    "krusch-skylight": "bin/krusch-skylight.js",
+    "krusch-skylight-mcp": "bin/krusch-skylight.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "sql",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "mcp": "node bin/krusch-skylight.js mcp",
+    "test": "node --test tests/*.test.js",
+    "lint": "if [ -x ../krusch-companion/client/node_modules/.bin/oxlint ]; then ../krusch-companion/client/node_modules/.bin/oxlint; else npx --yes oxlint; fi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kruschdev/krusch-companion-skylight-connector.git"
+  },
+  "keywords": [
+    "krusch-companion",
+    "openclaw",
+    "hermes-agent",
+    "mcp",
+    "mcp-server",
+    "skylight-calendar",
+    "skylight-two",
+    "smart-calendar",
+    "sovereign-ai",
+    "chores-sync",
+    "google-calendar",
+    "family-calendar"
+  ],
+  "author": "kruschdev",
+  "license": "MIT"
+}
+
