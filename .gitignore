@@ -10,3 +10,6 @@ node_modules/
 .agent/*.db-*
 coverage/
 .DS_Store
+*INFLIGHT*.md
+scratch/
+

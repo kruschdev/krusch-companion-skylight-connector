@@ -7,16 +7,20 @@
  * 3. Skylight "Magic Import" (Sidekick) Email Bridge (`<frame>@ourskylight.com` via G-Krusch Gmail)
  */
 
-import { assertCloudAllowed, sanitizeSyncRecord, logConnectorDebug } from './config.js';
+import { assertCloudAllowed, resolveCalendarBridgeUrl, sanitizeSyncRecord, logConnectorDebug } from './config.js';
 import { computeContentHash, todayIso } from './companion-bridge.js';
 
 export class CalendarSyncBridge {
   constructor(config = {}, skylightClient = null, companionBridge = null) {
     this.config = config;
     this.frameId = config.skylightFrameId || 'default-frame';
-    this.gKruschUrl = (config.gKruschUrl || 'http://127.0.0.1:5446').replace(/\/+$/, '');
+    if ('gKruschUrl' in config && (!config.gKruschUrl || typeof config.gKruschUrl !== 'string' || !config.gKruschUrl.trim())) {
+      throw new Error('gKruschUrl must be provided in configuration');
+    }
+    this.gKruschUrl = (config.gKruschUrl || resolveCalendarBridgeUrl()).replace(/\/+$/, '');
     this.magicImportEmail = config.skylightMagicImportEmail || null;
     this.allowCloud = Boolean(config.allowCloud);
+    assertCloudAllowed(this.gKruschUrl, this.allowCloud);
     this.skylightClient = skylightClient;
     this.companionBridge = companionBridge;
     this.fetchImpl = config.fetchImpl || fetch;

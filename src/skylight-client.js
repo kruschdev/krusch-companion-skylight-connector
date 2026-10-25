@@ -8,9 +8,48 @@
  * Strictly enforces opt-in cloud egress via assertCloudAllowed().
  */
 
-import { assertCloudAllowed } from './config.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { assertCloudAllowed, envConfig, logConnectorDebug } from './config.js';
 
 export const SKYLIGHT_API_VERSION = '2026-05-01';
+const SKYLIGHT_OAUTH_CLIENT_ID = 'skylight-mobile';
+const SKYLIGHT_OAUTH_REDIRECT_URI = 'https://ourskylight.com/welcome';
+
+function extractSetCookies(res, cookieJar) {
+  const rawCookies =
+    typeof res?.headers?.getSetCookie === 'function'
+      ? res.headers.getSetCookie()
+      : res?.headers?.get?.('set-cookie')
+        ? [res.headers.get('set-cookie')]
+        : [];
+  for (const cookieStr of rawCookies) {
+    const firstPart = String(cookieStr || '').split(';')[0];
+    const eqIdx = firstPart.indexOf('=');
+    if (eqIdx > 0) {
+      const name = firstPart.slice(0, eqIdx).trim();
+      const val = firstPart.slice(eqIdx + 1).trim();
+      cookieJar.set(name, val);
+    }
+  }
+}
+
+function formatCookieHeader(cookieJar) {
+  return Array.from(cookieJar.entries())
+    .filter(([, v]) => v !== '')
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
+function decodeHtmlEntities(str = '') {
+  return String(str)
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
 
 export class SkylightCloudClient {
   constructor(config = {}) {
@@ -18,11 +57,26 @@ export class SkylightCloudClient {
     this.email = config.skylightEmail || null;
     this.password = config.skylightPassword || null;
     this.token = config.skylightToken || null;
-    this.refreshToken = config.skylightRefreshToken || process.env.SKYLIGHT_REFRESH_TOKEN || null;
+    this.refreshToken = config.skylightRefreshToken || envConfig.skylightRefreshToken || null;
+    this.groceryListId = config.skylightGroceryListId || null;
+    this.todoListId = config.skylightTodoListId || null;
     this.userId = config.skylightUserId || null;
     this.defaultFrameId = config.skylightFrameId || 'default-frame';
     this.allowCloud = Boolean(config.allowCloud);
     this.fetchImpl = config.fetchImpl || fetch;
+    this._authScheme = 'Bearer';
+    this._skipCachedAccessToken = false;
+    this.tokenCachePath =
+      this.fetchImpl === fetch && config.companionDbPath
+        ? path.join(path.dirname(config.companionDbPath), '.skylight-oauth-session.json')
+        : null;
+    const cached = this._readTokenCache();
+    if (cached?.refreshToken) {
+      this.refreshToken = cached.refreshToken;
+    }
+    if (cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000) {
+      this.token = cached.accessToken;
+    }
   }
 
   /**
@@ -30,6 +84,39 @@ export class SkylightCloudClient {
    */
   isConfigured() {
     return Boolean(this.token || this.refreshToken || (this.email && this.password));
+  }
+
+  _readTokenCache() {
+    if (!this.tokenCachePath) return null;
+    try {
+      if (!fs.existsSync(this.tokenCachePath)) return null;
+      const parsed = JSON.parse(fs.readFileSync(this.tokenCachePath, 'utf8'));
+      if (!parsed || parsed.baseUrl !== this.baseUrl) return null;
+      if (this.email && parsed.email && parsed.email !== this.email) return null;
+      return parsed;
+    } catch (err) {
+      logConnectorDebug('readTokenCache', err);
+      return null;
+    }
+  }
+
+  _writeTokenCache({ accessToken, refreshToken, expiresIn }) {
+    if (!this.tokenCachePath || !accessToken) return;
+    try {
+      fs.mkdirSync(path.dirname(this.tokenCachePath), { recursive: true });
+      const ttlMs = Number(expiresIn) > 0 ? Number(expiresIn) * 1000 : 3600 * 1000;
+      const payload = {
+        baseUrl: this.baseUrl,
+        email: this.email || null,
+        accessToken,
+        refreshToken: refreshToken || this.refreshToken || null,
+        expiresAt: Date.now() + ttlMs,
+        updatedAt: new Date().toISOString()
+      };
+      fs.writeFileSync(this.tokenCachePath, JSON.stringify(payload, null, 2), { mode: 0o600 });
+    } catch (err) {
+      logConnectorDebug('writeTokenCache', err);
+    }
   }
 
   /**
@@ -45,16 +132,11 @@ export class SkylightCloudClient {
     };
 
     if (this.token) {
-      if (this.userId && !this.token.startsWith('Bearer ') && !this.token.startsWith('Basic ')) {
-        // Support both Bearer OAuth tokens and Basic userId:token session format
-        if (this.token.includes('.')) {
-          headers.Authorization = `Bearer ${this.token}`;
-        } else {
-          const encoded = Buffer.from(`${this.userId}:${this.token}`).toString('base64');
-          headers.Authorization = `Basic ${encoded}`;
-        }
-      } else if (this.token.startsWith('Bearer ') || this.token.startsWith('Basic ')) {
+      if (this.token.startsWith('Bearer ') || this.token.startsWith('Basic ')) {
         headers.Authorization = this.token;
+      } else if (this._authScheme === 'Basic' && this.userId) {
+        const encoded = Buffer.from(`${this.userId}:${this.token}`).toString('base64');
+        headers.Authorization = `Basic ${encoded}`;
       } else {
         headers.Authorization = `Bearer ${this.token}`;
       }
@@ -64,7 +146,219 @@ export class SkylightCloudClient {
   }
 
   /**
-   * Authenticate with Skylight OAuth2 refresh_token or session endpoint if no token is present.
+   * Perform Skylight's 4-step OAuth 2.0 + PKCE login flow against Rails + Doorkeeper.
+   * Returns null if the target server does not serve an OAuth PKCE HTML login page
+   * (allowing clean fallback to legacy /api/sessions in mock tests).
+   */
+  async _authenticateViaOAuthPkce() {
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('base64url');
+    const cookieJar = new Map();
+
+    const authorizeQuery = new URLSearchParams({
+      client_id: SKYLIGHT_OAUTH_CLIENT_ID,
+      response_type: 'code',
+      scope: 'everything',
+      redirect_uri: SKYLIGHT_OAUTH_REDIRECT_URI,
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256'
+    }).toString();
+
+    let currentUrl = `${this.baseUrl}/oauth/authorize?${authorizeQuery}`;
+    let currentRes = await this.fetchImpl(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: {
+        Accept: 'text/html,application/xhtml+xml,application/json',
+        'User-Agent': 'SkylightMobile (web)'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
+    extractSetCookies(currentRes, cookieJar);
+
+    let authCode = null;
+    for (let hop = 0; hop < 6 && [301, 302, 303, 307, 308].includes(currentRes.status); hop++) {
+      const loc = currentRes.headers?.get?.('location');
+      if (!loc) break;
+      const nextUrl = new URL(loc, currentUrl).toString();
+      const parsedNext = new URL(nextUrl);
+      if (parsedNext.searchParams.get('code')) {
+        const returnedState = parsedNext.searchParams.get('state');
+        if (returnedState && returnedState !== state) {
+          throw new Error('Skylight OAuth PKCE state mismatch during authorization.');
+        }
+        authCode = parsedNext.searchParams.get('code');
+        break;
+      }
+      if (!nextUrl.startsWith(this.baseUrl)) break;
+
+      const cookieHeader = formatCookieHeader(cookieJar);
+      currentUrl = nextUrl;
+      currentRes = await this.fetchImpl(currentUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/json',
+          'User-Agent': 'SkylightMobile (web)',
+          ...(cookieHeader ? { Cookie: cookieHeader } : {})
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+      extractSetCookies(currentRes, cookieJar);
+    }
+
+    if (!authCode) {
+      if (!currentRes.ok) return null;
+      const html = await currentRes.text();
+      const csrfMatch =
+        html.match(/<input[^>]*name=["']authenticity_token["'][^>]*value=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]*name=["']csrf-token["'][^>]*content=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]*content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i);
+      if (!csrfMatch) {
+        return null;
+      }
+      const csrfToken = decodeHtmlEntities(csrfMatch[1]);
+
+      const formMatch = html.match(
+        /<form[^>]*action=["']([^"']*\/auth\/session[^"']*)["'][^>]*>([\s\S]*?)<\/form>/i
+      );
+      const rawAction = formMatch ? decodeHtmlEntities(formMatch[1]) : '/auth/session';
+      const formInner = formMatch ? formMatch[2] : '';
+
+      const formParams = new URLSearchParams();
+      const hiddenInputRegex = /<input[^>]*type=["']hidden["'][^>]*>/gi;
+      let inputTagMatch;
+      while ((inputTagMatch = hiddenInputRegex.exec(formInner)) !== null) {
+        const tag = inputTagMatch[0];
+        const nameMatch = tag.match(/name=["']([^"']+)["']/i);
+        const valMatch = tag.match(/value=["']([^"']*)["']/i);
+        if (nameMatch) {
+          formParams.set(
+            decodeHtmlEntities(nameMatch[1]),
+            valMatch ? decodeHtmlEntities(valMatch[1]) : ''
+          );
+        }
+      }
+      if (!formParams.get('authenticity_token')) {
+        formParams.set('authenticity_token', csrfToken);
+      }
+      formParams.set('email', this.email);
+      formParams.set('password', this.password);
+
+      const postUrl = new URL(rawAction, currentUrl).toString();
+      const postCookies = formatCookieHeader(cookieJar);
+      let hopUrlBase = postUrl;
+      let hopRes = await this.fetchImpl(postUrl, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'text/html,application/xhtml+xml',
+          'User-Agent': 'SkylightMobile (web)',
+          Origin: new URL(this.baseUrl).origin,
+          Referer: currentUrl,
+          ...(postCookies ? { Cookie: postCookies } : {})
+        },
+        body: formParams.toString(),
+        signal: AbortSignal.timeout(10000)
+      });
+      extractSetCookies(hopRes, cookieJar);
+
+      for (let hop = 0; hop < 6 && [301, 302, 303, 307, 308].includes(hopRes.status); hop++) {
+        const loc = hopRes.headers?.get?.('location');
+        if (!loc) break;
+        const nextUrl = new URL(loc, hopUrlBase).toString();
+        const parsedNext = new URL(nextUrl);
+        if (parsedNext.pathname.includes('/mfa_challenge')) {
+          throw new Error(
+            'Skylight Cloud requires interactive MFA verification (/auth/mfa_challenge). Provide a refreshed SKYLIGHT_TOKEN/SKYLIGHT_REFRESH_TOKEN or use the 2-way G-Krusch Google Calendar bridge.'
+          );
+        }
+        if (parsedNext.searchParams.get('code')) {
+          const returnedState = parsedNext.searchParams.get('state');
+          if (returnedState && returnedState !== state) {
+            throw new Error('Skylight OAuth PKCE state mismatch after login.');
+          }
+          authCode = parsedNext.searchParams.get('code');
+          break;
+        }
+        if (parsedNext.searchParams.get('error')) {
+          throw new Error(
+            `Skylight OAuth error: ${parsedNext.searchParams.get('error_description') || parsedNext.searchParams.get('error')}`
+          );
+        }
+        if (!nextUrl.startsWith(this.baseUrl)) break;
+
+        const hopCookies = formatCookieHeader(cookieJar);
+        hopUrlBase = nextUrl;
+        hopRes = await this.fetchImpl(nextUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          headers: {
+            Accept: 'text/html,application/xhtml+xml',
+            'User-Agent': 'SkylightMobile (web)',
+            ...(hopCookies ? { Cookie: hopCookies } : {})
+          },
+          signal: AbortSignal.timeout(10000)
+        });
+        extractSetCookies(hopRes, cookieJar);
+      }
+
+      if (!authCode) {
+        throw new Error(
+          `Skylight OAuth PKCE login failed (HTTP ${hopRes.status}): no authorization code issued.`
+        );
+      }
+    }
+
+    const tokenRes = await this.fetchImpl(`${this.baseUrl}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        'User-Agent': 'SkylightMobile (web)'
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: SKYLIGHT_OAUTH_CLIENT_ID,
+        code: authCode,
+        redirect_uri: SKYLIGHT_OAUTH_REDIRECT_URI,
+        code_verifier: codeVerifier
+      }).toString(),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!tokenRes.ok) {
+      const errText = await tokenRes.text().catch(() => '');
+      throw new Error(
+        `Skylight OAuth token exchange failed (HTTP ${tokenRes.status}): ${errText.slice(0, 160)}`
+      );
+    }
+
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      throw new Error('Skylight OAuth token response did not include access_token.');
+    }
+
+    this.token = tokenData.access_token;
+    this._authScheme = 'Bearer';
+    if (tokenData.refresh_token) {
+      this.refreshToken = tokenData.refresh_token;
+    }
+    this._writeTokenCache({
+      accessToken: this.token,
+      refreshToken: this.refreshToken,
+      expiresIn: tokenData.expires_in
+    });
+
+    return { ok: true, token: this.token, userId: this.userId, mode: 'oauth_pkce' };
+  }
+
+  /**
+   * Authenticate with Skylight OAuth2 (cached token, refresh_token, or PKCE login)
+   * with fallback to legacy /api/sessions.
    */
   async authenticate() {
     assertCloudAllowed(this.baseUrl, this.allowCloud);
@@ -73,18 +367,39 @@ export class SkylightCloudClient {
       return { ok: true, token: this.token, userId: this.userId, mode: 'token' };
     }
 
-    if (this.refreshToken) {
+    const cached = this._readTokenCache();
+    if (
+      cached &&
+      !this._skipCachedAccessToken &&
+      cached.accessToken &&
+      cached.expiresAt &&
+      Date.now() < cached.expiresAt - 60_000
+    ) {
+      this.token = cached.accessToken;
+      this._authScheme = 'Bearer';
+      if (cached.refreshToken) this.refreshToken = cached.refreshToken;
+      return { ok: true, token: this.token, userId: this.userId, mode: 'oauth_cache' };
+    }
+    this._skipCachedAccessToken = false;
+
+    const candidateRefreshTokens = [
+      ...(cached?.refreshToken ? [cached.refreshToken] : []),
+      ...(this.refreshToken && this.refreshToken !== cached?.refreshToken ? [this.refreshToken] : [])
+    ];
+
+    for (const candidateRefresh of candidateRefreshTokens) {
       try {
         const refreshRes = await this.fetchImpl(`${this.baseUrl}/oauth/token`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
-            Accept: 'application/json'
+            Accept: 'application/json',
+            'User-Agent': 'SkylightMobile (web)'
           },
           body: new URLSearchParams({
             grant_type: 'refresh_token',
-            client_id: 'skylight-mobile',
-            refresh_token: this.refreshToken
+            client_id: SKYLIGHT_OAUTH_CLIENT_ID,
+            refresh_token: candidateRefresh
           }).toString(),
           signal: AbortSignal.timeout(8000)
         });
@@ -92,12 +407,18 @@ export class SkylightCloudClient {
           const tokenData = await refreshRes.json();
           if (tokenData.access_token) {
             this.token = tokenData.access_token;
+            this._authScheme = 'Bearer';
             if (tokenData.refresh_token) this.refreshToken = tokenData.refresh_token;
+            this._writeTokenCache({
+              accessToken: this.token,
+              refreshToken: this.refreshToken,
+              expiresIn: tokenData.expires_in
+            });
             return { ok: true, token: this.token, userId: this.userId, mode: 'oauth_refresh' };
           }
         }
-      } catch {
-        // Fall through to session login if refresh token fails
+      } catch (err) {
+        logConnectorDebug('authenticate.refresh', err);
       }
     }
 
@@ -105,6 +426,11 @@ export class SkylightCloudClient {
       throw new Error(
         'Skylight credentials not configured. Set SKYLIGHT_TOKEN or SKYLIGHT_EMAIL + SKYLIGHT_PASSWORD.'
       );
+    }
+
+    const pkceResult = await this._authenticateViaOAuthPkce();
+    if (pkceResult) {
+      return pkceResult;
     }
 
     const res = await this.fetchImpl(`${this.baseUrl}/api/sessions`, {
@@ -131,6 +457,7 @@ export class SkylightCloudClient {
       payload.meta?.token ||
       payload.access_token ||
       null;
+    this._authScheme = payload.access_token || String(this.token || '').includes('.') ? 'Bearer' : (this.userId ? 'Basic' : 'Bearer');
 
     if (!this.token) {
       throw new Error('Skylight authentication response did not include an access token.');
@@ -146,7 +473,7 @@ export class SkylightCloudClient {
   async _request(endpoint, { method = 'GET', body = null, query = null, retries = 1 } = {}) {
     assertCloudAllowed(this.baseUrl, this.allowCloud);
 
-    if (!this.token && this.email && this.password) {
+    if (!this.token && (this.refreshToken || (this.email && this.password))) {
       await this.authenticate();
     }
 
@@ -173,9 +500,14 @@ export class SkylightCloudClient {
         signal: AbortSignal.timeout(8000)
       });
 
-      if (res.status === 401 && !reauthenticated && this.email && this.password) {
+      if (
+        res.status === 401 &&
+        !reauthenticated &&
+        (this.refreshToken || (this.email && this.password))
+      ) {
         reauthenticated = true;
         this.token = null;
+        this._skipCachedAccessToken = true;
         await this.authenticate();
         continue;
       }
@@ -261,9 +593,18 @@ export class SkylightCloudClient {
   /**
    * 2. Chores (Maps to Krusch Companion 5-Tier Priority Board Tasks)
    */
-  async listChores(frameId = this.defaultFrameId, { date = null, status = null } = {}) {
+  async listChores(
+    frameId = this.defaultFrameId,
+    { date = null, after = null, before = null, status = null } = {}
+  ) {
+    const fallbackDate = date || new Date().toISOString().slice(0, 10);
     const payload = await this._request(`/api/frames/${encodeURIComponent(frameId)}/chores`, {
-      query: { date, status }
+      query: {
+        after: after || fallbackDate,
+        before: before || fallbackDate,
+        date,
+        status
+      }
     });
     return SkylightCloudClient.normalizeList(payload, 'chores');
   }
@@ -304,9 +645,18 @@ export class SkylightCloudClient {
     return SkylightCloudClient.normalizeRecord(payload.data || payload.chore || payload);
   }
 
+  static validateIdentifier(value, name = 'id') {
+    if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(value.trim())) {
+      throw new TypeError(`Invalid ${name} supplied to deleteChore`);
+    }
+    return value.trim();
+  }
+
   async deleteChore(frameId = this.defaultFrameId, choreId) {
+    const validFrameId = SkylightCloudClient.validateIdentifier(frameId, 'frameId');
+    const validChoreId = SkylightCloudClient.validateIdentifier(choreId, 'choreId');
     return this._request(
-      `/api/frames/${encodeURIComponent(frameId)}/chores/${encodeURIComponent(choreId)}`,
+      `/api/frames/${encodeURIComponent(validFrameId)}/chores/${encodeURIComponent(validChoreId)}`,
       { method: 'DELETE' }
     );
   }
@@ -391,11 +741,11 @@ export class SkylightCloudClient {
   _resolveNumericListId(_frameId, listId) {
     const raw = String(listId || 'grocery').trim();
     if (/^\d+$/.test(raw)) return raw;
-    const groceryId = process.env.SKYLIGHT_GROCERY_LIST_ID;
+    const groceryId = this.groceryListId || envConfig.skylightGroceryListId;
     if (groceryId && /^(grocery|groceries|shopping|grocery\s+list)$/i.test(raw)) {
       return groceryId;
     }
-    const todoId = process.env.SKYLIGHT_TODO_LIST_ID;
+    const todoId = this.todoListId || envConfig.skylightTodoListId;
     if (todoId && /^(todo|to_do|to-do|to-do\s+list)$/i.test(raw)) {
       return todoId;
     }

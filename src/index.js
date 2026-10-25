@@ -5,13 +5,22 @@
  * (5-tier priority board, tasks, checklists, schedule) with Skylight Calendar 2.
  */
 
-import { loadConfig, SCHEMA_VERSION } from './config.js';
+import {
+  loadConfig,
+  loadEnvConfig,
+  envConfig,
+  validateConnectorOptions,
+  SCHEMA_VERSION
+} from './config.js';
 import { SkylightCloudClient } from './skylight-client.js';
 import { CompanionBridge, todayIso } from './companion-bridge.js';
 import { CalendarSyncBridge } from './calendar-bridge.js';
 
 export {
   loadConfig,
+  loadEnvConfig,
+  envConfig,
+  validateConnectorOptions,
   validateSkylightConfig,
   envOr,
   envBool,
@@ -52,14 +61,16 @@ export {
  * and standalone universal agents like OpenClaw & Hermes (`dbPath` / `SKYLIGHT_DB_PATH`).
  */
 export function createSkylightConnector(options = {}) {
+  validateConnectorOptions(options);
+  const currentEnv = loadEnvConfig();
   const normalizedOptions = {
     ...options,
     ...(options.dbPath && !options.companionDbPath ? { companionDbPath: options.dbPath } : {}),
     ...(!options.companionDbPath &&
     !options.dbPath &&
-    process.env.SKYLIGHT_DB_PATH &&
-    !process.env.KRUSCH_COMPANION_DB_PATH
-      ? { companionDbPath: process.env.SKYLIGHT_DB_PATH }
+    currentEnv.skylightDbPath &&
+    !currentEnv.companionDbPath
+      ? { companionDbPath: currentEnv.skylightDbPath }
       : {})
   };
   const config = loadConfig(normalizedOptions);

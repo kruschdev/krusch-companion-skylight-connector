@@ -746,7 +746,323 @@ describe('@krusch/companion-skylight-connector test suite', () => {
     } finally {
       await httpServer.close();
     }
+
+    // 7. Verify BUG-01 & BUG-04: startMcpHttpServer rejects missing or invalid host/port/apiKey
+    assert.throws(
+      () => adapter.startMcpHttpServer({}),
+      /Missing or invalid SKYLIGHT_MCP_\* configuration/
+    );
+    assert.throws(
+      () => adapter.startMcpHttpServer({ port: -1, host: '127.0.0.1' }),
+      /Missing or invalid SKYLIGHT_MCP_\* configuration/
+    );
+    assert.throws(
+      () => adapter.startMcpHttpServer({ port: 5449, host: 'bad host!' }),
+      /Missing or invalid SKYLIGHT_MCP_\* configuration/
+    );
+    assert.throws(
+      () => adapter.startMcpHttpServer({ port: 5449, host: '127.0.0.1', apiKey: 'too_short' }),
+      /Missing or invalid SKYLIGHT_MCP_\* configuration/
+    );
+
+    // 8. Verify BUG-03: unhandled error in request handler returns 500 JSON-RPC -32603
+    const errServer = await adapter.startMcpHttpServer({
+      port: 0,
+      host: '127.0.0.1',
+      onRequestBody: async () => {
+        throw new Error('simulated internal failure');
+      }
+    });
+    try {
+      const errRes = await fetch(`http://127.0.0.1:${errServer.port}/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list' })
+      });
+      assert.equal(errRes.status, 500);
+      const errBody = await errRes.json();
+      assert.equal(errBody.jsonrpc, '2.0');
+      assert.equal(errBody.error.code, -32603);
+    } finally {
+      await errServer.close();
+    }
+
+    // 9. Verify BUG-01 (Lap 3): CALENDAR_BRIDGE_URL in getUniversalAgentManifest respects env & fallback
+    const prevBridgeUrl = process.env.CALENDAR_BRIDGE_URL;
+    try {
+      delete process.env.CALENDAR_BRIDGE_URL;
+      assert.equal(
+        adapter.getManifest().mcpServerConfig.mcpServers['krusch-skylight'].env.CALENDAR_BRIDGE_URL,
+        'http://127.0.0.1:5446'
+      );
+      process.env.CALENDAR_BRIDGE_URL = 'http://10.0.0.2:5446/';
+      assert.equal(
+        adapter.getManifest().mcpServerConfig.mcpServers['krusch-skylight'].env.CALENDAR_BRIDGE_URL,
+        'http://10.0.0.2:5446'
+      );
+    } finally {
+      if (prevBridgeUrl === undefined) {
+        delete process.env.CALENDAR_BRIDGE_URL;
+      } else {
+        process.env.CALENDAR_BRIDGE_URL = prevBridgeUrl;
+      }
+    }
+
+    // 10. Verify BUG-01, BUG-03 & TEST-01 (Lap 4): CalendarSyncBridge validates gKruschUrl and enforces assertCloudAllowed
+    const { CalendarSyncBridge } = await import('../src/calendar-bridge.js');
+    assert.throws(
+      () => new CalendarSyncBridge({ gKruschUrl: '' }),
+      /gKruschUrl must be provided in configuration/
+    );
+    assert.throws(
+      () => new CalendarSyncBridge({ gKruschUrl: 'https://evil.com', allowCloud: false }),
+      /AirGapSecurityError/
+    );
+    const allowedBridge = new CalendarSyncBridge({ gKruschUrl: 'https://api.ourskylight.com', allowCloud: true });
+    assert.equal(allowedBridge.gKruschUrl, 'https://api.ourskylight.com');
+
+    // 11. Verify TEST-01 & TEST-02 (Lap 5): resolveCalendarBridgeUrl precedence and _resolveEventStartTime edge-cases
+    const { resolveCalendarBridgeUrl } = await import('../src/config.js');
+    const savedCalUrl = process.env.CALENDAR_BRIDGE_URL;
+    const savedGKruschUrl = process.env.G_KRUSCH_URL;
+    try {
+      delete process.env.CALENDAR_BRIDGE_URL;
+      delete process.env.G_KRUSCH_URL;
+      assert.equal(resolveCalendarBridgeUrl('http://127.0.0.1:5446/'), 'http://127.0.0.1:5446');
+      process.env.CALENDAR_BRIDGE_URL = 'http://10.0.0.2:5446/';
+      assert.equal(resolveCalendarBridgeUrl(), 'http://10.0.0.2:5446');
+    } finally {
+      if (savedCalUrl === undefined) delete process.env.CALENDAR_BRIDGE_URL;
+      else process.env.CALENDAR_BRIDGE_URL = savedCalUrl;
+      if (savedGKruschUrl === undefined) delete process.env.G_KRUSCH_URL;
+      else process.env.G_KRUSCH_URL = savedGKruschUrl;
+    }
+
+    const dateOnlyIso = allowedBridge._resolveEventStartTime({ startTime: '2026-10-25' });
+    assert.equal(dateOnlyIso, new Date(2026, 9, 25, 10, 0, 0).toISOString());
+    const timeOnlyIso = allowedBridge._resolveEventStartTime({ date: '2026-10-25', startTime: '3:30 pm' });
+    assert.equal(timeOnlyIso, new Date(2026, 9, 25, 15, 30, 0).toISOString());
+
+    // 12. Verify BUG-01 & BUG-02 (Pass 3): executeOpenAiToolCall and executeAnthropicToolUse catch rejections cleanly
+    const openAiErrRes = await executeOpenAiToolCall(
+      { id: 'call_err_1', function: { name: 'skylight_status', arguments: '{}' } },
+      {
+        executor: async () => {
+          throw new Error('simulated OpenAI tool rejection');
+        }
+      }
+    );
+    assert.equal(openAiErrRes.tool_call_id, 'call_err_1');
+    assert.equal(openAiErrRes.role, 'tool');
+    assert.equal(openAiErrRes.result.ok, false);
+    assert.match(openAiErrRes.result.error, /simulated OpenAI tool rejection/);
+
+    const anthropicErrRes = await executeAnthropicToolUse(
+      { id: 'toolu_err_1', name: 'skylight_status', input: {} },
+      {
+        executor: async () => {
+          throw new Error('simulated Anthropic tool rejection');
+        }
+      }
+    );
+    assert.equal(anthropicErrRes.tool_use_id, 'toolu_err_1');
+    assert.equal(anthropicErrRes.is_error, true);
+    assert.equal(anthropicErrRes.result.ok, false);
+    assert.match(anthropicErrRes.result.error, /simulated Anthropic tool rejection/);
+
+    // 13. Verify SEC-01 (Pass 4): SkylightCloudClient.deleteChore validates frameId and choreId
+    const { SkylightCloudClient } = await import('../src/skylight-client.js');
+    const secClient = new SkylightCloudClient({
+      skylightBaseUrl: 'http://127.0.0.1:19999',
+      skylightToken: 'tok-test',
+      fetchImpl: async () => new Response(JSON.stringify({ deleted: true }), { status: 200 })
+    });
+    await assert.rejects(() => secClient.deleteChore('', 'valid-chore-1'), {
+      name: 'TypeError',
+      message: /Invalid frameId supplied to deleteChore/
+    });
+    await assert.rejects(() => secClient.deleteChore('frame-1', '../bad-chore'), {
+      name: 'TypeError',
+      message: /Invalid choreId supplied to deleteChore/
+    });
+    const delOk = await secClient.deleteChore('frame-1', '123e4567-e89b-12d3-a456-426614174000');
+    assert.equal(delOk.deleted, true);
+
+    // 14. Verify SEC-01 & SEC-02 (Pass 5): loadEnvConfig centralization and createSkylightConnector option validation
+    const { loadEnvConfig, envConfig, validateConnectorOptions } = await import('../src/config.js');
+    const savedGrocery = process.env.SKYLIGHT_GROCERY_LIST_ID;
+    try {
+      process.env.SKYLIGHT_GROCERY_LIST_ID = '987654';
+      assert.equal(loadEnvConfig().skylightGroceryListId, '987654');
+      assert.equal(envConfig.skylightGroceryListId, '987654');
+    } finally {
+      if (savedGrocery === undefined) delete process.env.SKYLIGHT_GROCERY_LIST_ID;
+      else process.env.SKYLIGHT_GROCERY_LIST_ID = savedGrocery;
+    }
+
+    assert.throws(
+      () => validateConnectorOptions({ unknownEvilOption: true }),
+      /Unknown Skylight Connector option key: "unknownEvilOption"/
+    );
+    assert.throws(
+      () => createSkylightConnector({ dbPath: '   ' }),
+      /Invalid Skylight Connector option "dbPath"/
+    );
+    assert.throws(
+      () => createSkylightConnector({ companionDbPath: '/tmp/privileged/db.sqlite' }),
+      /AirGapSecurityError/
+    );
+
+    // 15. Verify SEC-01 & PERF-01 (Pass 6): executeUniversalToolCall validates rawArgs type and enforces concurrency/timeout limits
+    const { executeUniversalToolCall } = await import('../src/universal-adapter.js');
+    const invalidNumRes = await executeUniversalToolCall('skylight_status', 123);
+    assert.deepEqual(invalidNumRes, {
+      ok: false,
+      tool: 'skylight_status',
+      summary: 'Invalid argument type for skylight_status: number'
+    });
+
+    const invalidArrRes = await executeUniversalToolCall('skylight_status', '[]');
+    assert.deepEqual(invalidArrRes, {
+      ok: false,
+      tool: 'skylight_status',
+      summary: 'Invalid argument type for skylight_status: array'
+    });
+
+    const timeoutRes = await executeUniversalToolCall(
+      'skylight_status',
+      {},
+      {
+        callTimeoutMs: 20,
+        plugin: {
+          execute: () => new Promise(resolve => setTimeout(() => resolve({ ok: true }), 100))
+        }
+      }
+    );
+    assert.deepEqual(timeoutRes, {
+      ok: false,
+      tool: 'skylight_status',
+      summary: 'Tool call timed out'
+    });
+
+    let releaseSlowCall;
+    const slowPromise = executeUniversalToolCall(
+      'skylight_status',
+      {},
+      {
+        maxConcurrent: 1,
+        plugin: {
+          execute: () =>
+            new Promise(resolve => {
+              releaseSlowCall = () => resolve({ ok: true, tool: 'skylight_status', summary: 'ok' });
+            })
+        }
+      }
+    );
+    const overloadRes = await executeUniversalToolCall(
+      'skylight_status',
+      {},
+      {
+        maxConcurrent: 1,
+        plugin: { execute: async () => ({ ok: true }) }
+      }
+    );
+    assert.deepEqual(overloadRes, {
+      ok: false,
+      tool: 'skylight_status',
+      summary: 'Server overloaded – too many concurrent tool calls'
+    });
+    releaseSlowCall();
+    const completedSlow = await slowPromise;
+    assert.equal(completedSlow.ok, true);
+
+    // 16. Verify OAuth 2.0 + PKCE 4-step login & Bearer header with opaque Doorkeeper token + userId
+    let capturedAuthHeader = null;
+    let capturedState = null;
+    let capturedChallenge = null;
+    const mockPkceFetch = async (url, options = {}) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === '/oauth/authorize' && (!options.headers?.Cookie || !options.headers.Cookie.includes('authed_sess'))) {
+        capturedState = parsed.searchParams.get('state');
+        capturedChallenge = parsed.searchParams.get('code_challenge');
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: `/auth/session/new?${parsed.searchParams.toString()}`,
+            'set-cookie': 'skylightcloud_session=prelogin_sess; path=/; httponly'
+          }
+        });
+      }
+      if (parsed.pathname === '/auth/session/new') {
+        return new Response(
+          `<html><head><meta name="csrf-token" content="rails_csrf_token_abc"></head>
+           <body><form action="/auth/session?client_id=skylight-mobile&amp;state=${capturedState}" method="post">
+             <input type="hidden" name="return_to" value="/oauth/authorize?state=${capturedState}" />
+           </form></body></html>`,
+          { status: 200, headers: { 'content-type': 'text/html' } }
+        );
+      }
+      if (parsed.pathname === '/auth/session' && options.method === 'POST') {
+        const form = new URLSearchParams(options.body);
+        assert.equal(form.get('authenticity_token'), 'rails_csrf_token_abc');
+        assert.equal(form.get('email'), 'family@krusch.dev');
+        assert.equal(options.headers.Cookie, 'skylightcloud_session=prelogin_sess');
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: `/oauth/authorize?state=${capturedState}`,
+            'set-cookie': 'skylightcloud_session=authed_sess; path=/; httponly'
+          }
+        });
+      }
+      if (parsed.pathname === '/oauth/authorize') {
+        assert.equal(options.headers.Cookie, 'skylightcloud_session=authed_sess');
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: `https://ourskylight.com/welcome?code=pkce_auth_code_777&state=${capturedState}`
+          }
+        });
+      }
+      if (parsed.pathname === '/oauth/token' && options.method === 'POST') {
+        const tokenForm = new URLSearchParams(options.body);
+        assert.equal(tokenForm.get('grant_type'), 'authorization_code');
+        assert.equal(tokenForm.get('code'), 'pkce_auth_code_777');
+        assert.ok(tokenForm.get('code_verifier').length >= 40);
+        assert.ok(capturedChallenge.length >= 40);
+        return new Response(
+          JSON.stringify({
+            access_token: 'opaque_doorkeeper_access_token_without_dots',
+            refresh_token: 'opaque_doorkeeper_refresh_token_rotated',
+            token_type: 'Bearer',
+            expires_in: 7200
+          }),
+          { status: 200 }
+        );
+      }
+      if (parsed.pathname === '/api/frames') {
+        capturedAuthHeader = options.headers?.Authorization;
+        return new Response(
+          JSON.stringify({ data: [{ id: 'frame-test-101', type: 'frame', attributes: { name: 'Household Calendar' } }] }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+
+    const pkceClient = new SkylightCloudClient({
+      skylightBaseUrl: 'https://app.ourskylight.com',
+      skylightEmail: 'family@krusch.dev',
+      skylightPassword: 'test_password',
+      skylightUserId: 'user-test-202',
+      allowCloud: true,
+      fetchImpl: mockPkceFetch
+    });
+    const pkceFrames = await pkceClient.listFrames();
+    assert.equal(pkceFrames.length, 1);
+    assert.equal(pkceFrames[0].id, 'frame-test-101');
+    assert.equal(capturedAuthHeader, 'Bearer opaque_doorkeeper_access_token_without_dots');
+    assert.equal(pkceClient.refreshToken, 'opaque_doorkeeper_refresh_token_rotated');
   });
 });
-
 

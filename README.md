@@ -48,8 +48,9 @@ export SKYLIGHT_TOKEN="your_skylight_token"
 # Optional: Magic Import email address for Sidekick parsing
 export SKYLIGHT_MAGIC_IMPORT_EMAIL="yourframe@ourskylight.com"
 
-# Optional: Universal SQLite DB path
+# Optional: Universal SQLite DB path & Calendar Bridge URL
 export SKYLIGHT_DB_PATH="./data/skylight.db"
+export CALENDAR_BRIDGE_URL="http://127.0.0.1:5446"
 ```
 
 ### 1. Universal CLI (`krusch-skylight`)

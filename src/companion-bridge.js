@@ -61,10 +61,15 @@ export class CompanionBridge {
 
     const dir = path.dirname(this.companionDbPath);
     if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
     }
 
     this.db = new DatabaseSync(this.companionDbPath);
+    try {
+      fs.chmodSync(this.companionDbPath, 0o640);
+    } catch (err) {
+      logConnectorDebug('_getDb:chmod', err);
+    }
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec('PRAGMA synchronous = NORMAL;');

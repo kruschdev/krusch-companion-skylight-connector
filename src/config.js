@@ -10,12 +10,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const SCHEMA_VERSION = 1;
+export const DEFAULT_CALENDAR_BRIDGE_URL = 'http://127.0.0.1:5446';
 
 /**
  * Debug-guarded observability helper replacing silent catch blocks.
  */
 export function logConnectorDebug(context, err) {
-  if (process.env.KRUSCH_DEBUG === '1') {
+  if (envBool('KRUSCH_DEBUG', false)) {
     console.warn(`[SkylightConnector:${context}]`, err?.message || err);
   }
 }
@@ -29,6 +30,101 @@ export function envOr(key, fallback = null) {
     return fallback;
   }
   return String(val).trim();
+}
+
+/**
+ * Centralized environment variable snapshot for Skylight Connector (SEC-01).
+ */
+export function loadEnvConfig() {
+  return {
+    skylightDbPath: envOr('SKYLIGHT_DB_PATH'),
+    companionDbPath: envOr('KRUSCH_COMPANION_DB_PATH'),
+    skylightBaseUrl: envOr('SKYLIGHT_BASE_URL', 'https://app.ourskylight.com'),
+    skylightEmail: envOr('SKYLIGHT_EMAIL'),
+    skylightPassword: envOr('SKYLIGHT_PASSWORD'),
+    skylightToken: envOr('SKYLIGHT_TOKEN'),
+    skylightRefreshToken: envOr('SKYLIGHT_REFRESH_TOKEN'),
+    skylightUserId: envOr('SKYLIGHT_USER_ID'),
+    skylightFrameId: envOr('SKYLIGHT_FRAME_ID', 'default-frame'),
+    skylightMagicImportEmail: envOr('SKYLIGHT_MAGIC_IMPORT_EMAIL'),
+    skylightGroceryListId: envOr('SKYLIGHT_GROCERY_LIST_ID'),
+    skylightTodoListId: envOr('SKYLIGHT_TODO_LIST_ID'),
+    calendarBridgeUrl: envOr('CALENDAR_BRIDGE_URL'),
+    gKruschUrl: envOr('G_KRUSCH_URL'),
+    allowCloud: envBool('ALLOW_SKYLIGHT', false) || envBool('ALLOW_CLOUD', false),
+    debug: envBool('KRUSCH_DEBUG', false)
+  };
+}
+
+export const envConfig = new Proxy(
+  {},
+  {
+    get(_target, prop) {
+      return loadEnvConfig()[prop];
+    }
+  }
+);
+
+export const ALLOWED_CONNECTOR_OPTION_KEYS = new Set([
+  'dbPath',
+  'companionDbPath',
+  'skylightBaseUrl',
+  'skylightEmail',
+  'skylightPassword',
+  'skylightToken',
+  'skylightRefreshToken',
+  'skylightUserId',
+  'skylightFrameId',
+  'skylightMagicImportEmail',
+  'skylightGroceryListId',
+  'skylightTodoListId',
+  'calendarBridgeUrl',
+  'gKruschUrl',
+  'primaryCalendarProfile',
+  'primaryCalendarLabel',
+  'primaryCalendarId',
+  'secondaryCalendarProfile',
+  'secondaryCalendarLabel',
+  'secondaryCalendarId',
+  'extendedFamilyKeywords',
+  'defaultCategoryLabel',
+  'allowCloud',
+  'fetchImpl',
+  'port',
+  'host',
+  'apiKey',
+  'maxBodyBytes',
+  'onRequestBody'
+]);
+
+/**
+ * Validate and sanitize options supplied to createSkylightConnector (SEC-02).
+ */
+export function validateConnectorOptions(opts = {}) {
+  if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+    throw new Error('Invalid Skylight Connector options: expected a plain object.');
+  }
+  for (const key of Object.keys(opts)) {
+    if (!ALLOWED_CONNECTOR_OPTION_KEYS.has(key)) {
+      throw new Error(`Unknown Skylight Connector option key: "${key}"`);
+    }
+  }
+  for (const pathKey of ['dbPath', 'companionDbPath']) {
+    if (opts[pathKey] !== undefined) {
+      if (typeof opts[pathKey] !== 'string' || !opts[pathKey].trim() || opts[pathKey].includes('\0')) {
+        throw new Error(`Invalid Skylight Connector option "${pathKey}": must be a non-empty filesystem path string.`);
+      }
+      assertMatterNotPrivileged(opts[pathKey]);
+    }
+  }
+  return opts;
+}
+
+/**
+ * Resolve configured Calendar Bridge URL from environment or fallback (BUG-01).
+ */
+export function resolveCalendarBridgeUrl(fallback = DEFAULT_CALENDAR_BRIDGE_URL) {
+  return (envOr('CALENDAR_BRIDGE_URL') || envOr('G_KRUSCH_URL') || fallback).replace(/\/+$/, '');
 }
 
 /**
@@ -328,10 +424,9 @@ export function loadConfig(overrides = {}) {
 
   const skylightEmail = overrides.skylightEmail || envOr('SKYLIGHT_EMAIL');
   const skylightPassword = overrides.skylightPassword || envOr('SKYLIGHT_PASSWORD');
-  const skylightToken =
-    overrides.skylightToken ||
-    envOr('SKYLIGHT_TOKEN') ||
-    envOr('SKYLIGHT_REFRESH_TOKEN');
+  const skylightToken = overrides.skylightToken || envOr('SKYLIGHT_TOKEN');
+  const skylightRefreshToken =
+    overrides.skylightRefreshToken || envOr('SKYLIGHT_REFRESH_TOKEN');
   const skylightUserId = overrides.skylightUserId || envOr('SKYLIGHT_USER_ID');
   const skylightFrameId = overrides.skylightFrameId || envOr('SKYLIGHT_FRAME_ID', 'default-frame');
   const skylightMagicImportEmail =
@@ -347,8 +442,7 @@ export function loadConfig(overrides = {}) {
   const gKruschUrl = (
     overrides.calendarBridgeUrl ||
     overrides.gKruschUrl ||
-    envOr('CALENDAR_BRIDGE_URL') ||
-    envOr('G_KRUSCH_URL', 'http://127.0.0.1:5446')
+    resolveCalendarBridgeUrl()
   ).replace(/\/+$/, '');
 
   const primaryCalendarProfile =
@@ -390,6 +484,7 @@ export function loadConfig(overrides = {}) {
     skylightEmail,
     skylightPassword,
     skylightToken,
+    skylightRefreshToken,
     skylightUserId,
     skylightFrameId,
     skylightMagicImportEmail,

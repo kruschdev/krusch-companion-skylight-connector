@@ -9,7 +9,7 @@
 import http from 'http';
 import readline from 'readline';
 import { createCompanionToolPlugin, createSkylightConnector } from './index.js';
-import { SCHEMA_VERSION } from './config.js';
+import { SCHEMA_VERSION, envOr, logConnectorDebug, resolveCalendarBridgeUrl } from './config.js';
 
 export const CONNECTOR_VERSION = '0.3.0';
 
@@ -431,10 +431,26 @@ export function getAnthropicToolSchemas({ granular = false } = {}) {
   }));
 }
 
+let activeCalls = 0;
+export const MAX_CONCURRENT = 5;
+export const CALL_TIMEOUT_MS = 30_000;
+
 /**
  * Execute any unified (`skylight_calendar`) or granular (`skylight_*`) tool call.
  */
 export async function executeUniversalToolCall(toolName, rawArgs = {}, options = {}) {
+  if (
+    rawArgs === null ||
+    Array.isArray(rawArgs) ||
+    (typeof rawArgs !== 'string' && typeof rawArgs !== 'object')
+  ) {
+    return {
+      ok: false,
+      tool: toolName,
+      summary: `Invalid argument type for ${toolName}: ${rawArgs === null ? 'null' : Array.isArray(rawArgs) ? 'array' : typeof rawArgs}`
+    };
+  }
+
   let parsedArgs = rawArgs;
   if (typeof rawArgs === 'string') {
     try {
@@ -444,6 +460,13 @@ export async function executeUniversalToolCall(toolName, rawArgs = {}, options =
         ok: false,
         tool: toolName,
         summary: `Invalid JSON arguments for ${toolName}: ${err.message}`
+      };
+    }
+    if (parsedArgs === null || Array.isArray(parsedArgs) || typeof parsedArgs !== 'object') {
+      return {
+        ok: false,
+        tool: toolName,
+        summary: `Invalid argument type for ${toolName}: ${parsedArgs === null ? 'null' : Array.isArray(parsedArgs) ? 'array' : typeof parsedArgs}`
       };
     }
   }
@@ -460,14 +483,54 @@ export async function executeUniversalToolCall(toolName, rawArgs = {}, options =
     };
   }
 
-  const plugin = createCompanionToolPlugin(options);
-  return plugin.execute(
-    {
-      ...parsedArgs,
-      action: action || 'status'
-    },
-    options
-  );
+  const {
+    maxConcurrent = MAX_CONCURRENT,
+    callTimeoutMs = CALL_TIMEOUT_MS,
+    plugin: injectedPlugin,
+    ...connectorOptions
+  } = options || {};
+
+  if (activeCalls >= maxConcurrent) {
+    return {
+      ok: false,
+      tool: normalizedName,
+      summary: 'Server overloaded – too many concurrent tool calls'
+    };
+  }
+
+  activeCalls++;
+  let timeoutHandle = null;
+  try {
+    const plugin = injectedPlugin || createCompanionToolPlugin(connectorOptions);
+    const pluginPromise = Promise.resolve(
+      plugin.execute(
+        {
+          ...parsedArgs,
+          action: action || 'status'
+        },
+        connectorOptions
+      )
+    );
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new Error('Tool call timed out')), callTimeoutMs);
+      if (timeoutHandle && typeof timeoutHandle.unref === 'function') {
+        timeoutHandle.unref();
+      }
+    });
+    return await Promise.race([pluginPromise, timeoutPromise]);
+  } catch (err) {
+    if (err?.message === 'Tool call timed out') {
+      return {
+        ok: false,
+        tool: normalizedName,
+        summary: 'Tool call timed out'
+      };
+    }
+    throw err;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    activeCalls = Math.max(0, activeCalls - 1);
+  }
 }
 
 /**
@@ -477,14 +540,27 @@ export async function executeOpenAiToolCall(toolCall, options = {}) {
   const callId = toolCall?.id || `call_${Date.now()}`;
   const fnName = toolCall?.function?.name || toolCall?.name || 'skylight_calendar';
   const rawArgs = toolCall?.function?.arguments ?? toolCall?.arguments ?? {};
-  const result = await executeUniversalToolCall(fnName, rawArgs, options);
-  return {
-    tool_call_id: callId,
-    role: 'tool',
-    name: fnName,
-    content: JSON.stringify(result),
-    result
-  };
+  const runner = typeof options?.executor === 'function' ? options.executor : executeUniversalToolCall;
+  try {
+    const result = await runner(fnName, rawArgs, options);
+    return {
+      tool_call_id: callId,
+      role: 'tool',
+      name: fnName,
+      content: JSON.stringify(result),
+      result
+    };
+  } catch (err) {
+    logConnectorDebug('OpenAI tool call', err);
+    const errorPayload = { ok: false, error: err?.message || String(err) };
+    return {
+      tool_call_id: callId,
+      role: 'tool',
+      name: fnName,
+      content: JSON.stringify(errorPayload),
+      result: errorPayload
+    };
+  }
 }
 
 /**
@@ -494,14 +570,28 @@ export async function executeAnthropicToolUse(toolUseBlock, options = {}) {
   const toolUseId = toolUseBlock?.id || `toolu_${Date.now()}`;
   const fnName = toolUseBlock?.name || 'skylight_calendar';
   const input = toolUseBlock?.input || {};
-  const result = await executeUniversalToolCall(fnName, input, options);
-  return {
-    type: 'tool_result',
-    tool_use_id: toolUseId,
-    is_error: result?.ok === false,
-    content: result?.summary ? `${result.summary}\n\n${JSON.stringify(result.data || result, null, 2)}` : JSON.stringify(result),
-    result
-  };
+  const runner = typeof options?.executor === 'function' ? options.executor : executeUniversalToolCall;
+  try {
+    const result = await runner(fnName, input, options);
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUseId,
+      is_error: result?.ok === false,
+      content: result?.summary ? `${result.summary}\n\n${JSON.stringify(result.data || result, null, 2)}` : JSON.stringify(result),
+      result
+    };
+  } catch (err) {
+    logConnectorDebug('Anthropic tool use', err);
+    const errorPayload = { ok: false, error: err?.message || String(err) };
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUseId,
+      role: 'tool_result',
+      is_error: true,
+      content: JSON.stringify(errorPayload),
+      result: errorPayload
+    };
+  }
 }
 
 /**
@@ -535,7 +625,7 @@ export function getUniversalAgentManifest() {
           args: ['mcp'],
           env: {
             ALLOW_SKYLIGHT: '0',
-            CALENDAR_BRIDGE_URL: 'http://127.0.0.1:5446'
+            CALENDAR_BRIDGE_URL: resolveCalendarBridgeUrl()
           }
         }
       }
@@ -862,120 +952,157 @@ export function startMcpStdioServer(options = {}) {
  * - `GET  /health`    : Health & manifest check
  */
 export function startMcpHttpServer(options = {}) {
-  const port = Number(options.port ?? process.env.SKYLIGHT_MCP_PORT ?? 5449);
-  const host = options.host || process.env.SKYLIGHT_MCP_HOST || '127.0.0.1';
-  const apiKey = options.apiKey ?? process.env.SKYLIGHT_MCP_API_KEY ?? null;
+  const rawPort = options.port ?? envOr('SKYLIGHT_MCP_PORT');
+  const port =
+    rawPort !== undefined && rawPort !== null && String(rawPort).trim() !== ''
+      ? Number(rawPort)
+      : NaN;
+  const host = options.host || envOr('SKYLIGHT_MCP_HOST');
+  const apiKey = options.apiKey ?? envOr('SKYLIGHT_MCP_API_KEY', null);
   const maxBodyBytes = Number(options.maxBodyBytes || MAX_MCP_PAYLOAD_BYTES);
 
+  const isEphemeralPort = options.port === 0 && port === 0;
+  const isValidPort = isEphemeralPort || (Number.isInteger(port) && port > 0 && port <= 65535);
+  const isValidHost =
+    typeof host === 'string' &&
+    host.length > 0 &&
+    /^(?:[a-zA-Z0-9.-]+|\d{1,3}(?:\.\d{1,3}){3})$/.test(host);
+  const isValidApiKey =
+    apiKey === null
+      ? !options.requireApiKey
+      : typeof apiKey === 'string' && /^[A-Za-z0-9_-]{16,}$/.test(apiKey);
+
+  if (!isValidPort || !isValidHost || !isValidApiKey) {
+    throw new Error('Missing or invalid SKYLIGHT_MCP_* configuration');
+  }
+
   const server = http.createServer(async (req, res) => {
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    try {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-
-    if (req.method === 'GET' && url.pathname === '/health') {
-      res.writeHead(200);
-      res.end(
-        JSON.stringify({
-          ok: true,
-          service: 'krusch-skylight-mcp',
-          version: CONNECTOR_VERSION,
-          supportedAgents: getUniversalAgentManifest().supportedAgents
-        })
-      );
-      return;
-    }
-
-    // Optional Bearer / X-API-Key authentication guard when SKYLIGHT_MCP_API_KEY is configured
-    if (apiKey) {
-      const authHeader = String(req.headers.authorization || '').trim();
-      const headerKey = String(req.headers['x-api-key'] || '').trim();
-      const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
-        ? authHeader.slice(7).trim()
-        : '';
-      if (bearerToken !== apiKey && headerKey !== apiKey) {
-        res.writeHead(401);
-        res.end(JSON.stringify({ ok: false, error: 'Unauthorized: valid SKYLIGHT_MCP_API_KEY required' }));
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
         return;
       }
-    }
 
-    if (req.method === 'GET' && (url.pathname === '/tools' || url.pathname === '/mcp/tools')) {
-      const format = (url.searchParams.get('format') || 'mcp').toLowerCase();
-      const granular = url.searchParams.get('granular') !== '0';
-      let toolsPayload;
-      if (format === 'claude' || format === 'claudebot' || format === 'anthropic') {
-        toolsPayload = getAnthropicToolSchemas({ granular });
-      } else if (['openai', 'grok', 'grokbot', 'xai', 'hermes', 'muse', 'openclaw', 'clawdbot'].includes(format)) {
-        toolsPayload = getOpenAiToolSchemas({ granular });
-      } else {
-        toolsPayload = getMcpToolDefinitions({ granular: true, includeUnified: true });
+      const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+
+      if (req.method === 'GET' && url.pathname === '/health') {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            ok: true,
+            service: 'krusch-skylight-mcp',
+            version: CONNECTOR_VERSION,
+            supportedAgents: getUniversalAgentManifest().supportedAgents
+          })
+        );
+        return;
       }
-      res.writeHead(200);
-      res.end(JSON.stringify({ ok: true, format, count: toolsPayload.length, tools: toolsPayload }));
-      return;
-    }
 
-    if (req.method === 'POST' && (url.pathname === '/mcp' || url.pathname === '/tools/call')) {
-      const chunks = [];
-      let totalBytes = 0;
-      for await (const chunk of req) {
-        totalBytes += chunk.length;
-        if (totalBytes > maxBodyBytes) {
-          res.writeHead(413);
-          res.end(JSON.stringify({ ok: false, error: 'Payload Too Large (max 1MB)' }));
-          req.destroy();
+      // Optional Bearer / X-API-Key authentication guard when SKYLIGHT_MCP_API_KEY is configured
+      if (apiKey) {
+        const authHeader = String(req.headers.authorization || '').trim();
+        const headerKey = String(req.headers['x-api-key'] || '').trim();
+        const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
+          ? authHeader.slice(7).trim()
+          : '';
+        if (bearerToken !== apiKey && headerKey !== apiKey) {
+          res.writeHead(401);
+          res.end(JSON.stringify({ ok: false, error: 'Unauthorized: valid SKYLIGHT_MCP_API_KEY required' }));
           return;
         }
-        chunks.push(chunk);
       }
-      const rawBody = Buffer.concat(chunks).toString('utf8');
-      let body;
-      try {
-        body = rawBody.trim() ? JSON.parse(rawBody) : {};
-      } catch {
-        res.writeHead(400);
-        res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body' }));
+
+      if (req.method === 'GET' && (url.pathname === '/tools' || url.pathname === '/mcp/tools')) {
+        const format = (url.searchParams.get('format') || 'mcp').toLowerCase();
+        const granular = url.searchParams.get('granular') !== '0';
+        let toolsPayload;
+        if (format === 'claude' || format === 'claudebot' || format === 'anthropic') {
+          toolsPayload = getAnthropicToolSchemas({ granular });
+        } else if (['openai', 'grok', 'grokbot', 'xai', 'hermes', 'muse', 'openclaw', 'clawdbot'].includes(format)) {
+          toolsPayload = getOpenAiToolSchemas({ granular });
+        } else {
+          toolsPayload = getMcpToolDefinitions({ granular: true, includeUnified: true });
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, format, count: toolsPayload.length, tools: toolsPayload }));
         return;
       }
 
-      if (url.pathname === '/mcp' || body.jsonrpc === '2.0') {
-        const rpcRes = await handleMcpJsonRpc(body, options);
-        res.writeHead(rpcRes ? 200 : 202);
-        res.end(rpcRes ? JSON.stringify(rpcRes) : '');
-        return;
-      }
+      if (req.method === 'POST' && (url.pathname === '/mcp' || url.pathname === '/tools/call')) {
+        const chunks = [];
+        let totalBytes = 0;
+        for await (const chunk of req) {
+          totalBytes += chunk.length;
+          if (totalBytes > maxBodyBytes) {
+            res.writeHead(413);
+            res.end(JSON.stringify({ ok: false, error: 'Payload Too Large (max 1MB)' }));
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
+        }
+        const rawBody = Buffer.concat(chunks).toString('utf8');
+        let body;
+        try {
+          body = rawBody.trim() ? JSON.parse(rawBody) : {};
+        } catch {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body' }));
+          return;
+        }
 
-      // Universal Bot Webhook (`/tools/call`) supporting OpenAI/Grok, Claude, or direct `{ tool, arguments }`
-      if (body.type === 'tool_use' || body.input) {
-        const out = await executeAnthropicToolUse(body, options);
+        if (typeof options.onRequestBody === 'function') {
+          await options.onRequestBody(body, req);
+        }
+
+        if (url.pathname === '/mcp' || body.jsonrpc === '2.0') {
+          const rpcRes = await handleMcpJsonRpc(body, options);
+          res.writeHead(rpcRes ? 200 : 202);
+          res.end(rpcRes ? JSON.stringify(rpcRes) : '');
+          return;
+        }
+
+        // Universal Bot Webhook (`/tools/call`) supporting OpenAI/Grok, Claude, or direct `{ tool, arguments }`
+        if (body.type === 'tool_use' || body.input) {
+          const out = await executeAnthropicToolUse(body, options);
+          res.writeHead(200);
+          res.end(JSON.stringify(out));
+          return;
+        }
+        if (body.function) {
+          const out = await executeOpenAiToolCall(body, options);
+          res.writeHead(200);
+          res.end(JSON.stringify(out));
+          return;
+        }
+
+        const toolName = body.tool || body.name || 'skylight_calendar';
+        const toolArgs = body.arguments || body.args || body;
+        const out = await executeUniversalToolCall(toolName, toolArgs, options);
         res.writeHead(200);
         res.end(JSON.stringify(out));
         return;
       }
-      if (body.function) {
-        const out = await executeOpenAiToolCall(body, options);
-        res.writeHead(200);
-        res.end(JSON.stringify(out));
-        return;
-      }
 
-      const toolName = body.tool || body.name || 'skylight_calendar';
-      const toolArgs = body.arguments || body.args || body;
-      const out = await executeUniversalToolCall(toolName, toolArgs, options);
-      res.writeHead(200);
-      res.end(JSON.stringify(out));
-      return;
+      res.writeHead(404);
+      res.end(JSON.stringify({ ok: false, error: `Route not found: ${req.method} ${url.pathname}` }));
+    } catch (err) {
+      console.error('[SkylightMCP] Internal server error:', err?.message || err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+      }
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: 'Internal server error' },
+          id: null
+        })
+      );
     }
-
-    res.writeHead(404);
-    res.end(JSON.stringify({ ok: false, error: `Route not found: ${req.method} ${url.pathname}` }));
   });
 
   return new Promise((resolve, reject) => {
