@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync as NodeSqliteDriver } from 'node:sqlite';
 import {
   assertCloudAllowed,
   assertMatterNotPrivileged,
@@ -19,6 +19,79 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+async function resolveOpenSqliteDb() {
+  const siblingSqliteUrl = new URL('../../../lib/sqlite.js', import.meta.url);
+  if (fs.existsSync(siblingSqliteUrl)) {
+    try {
+      const mod = await import(siblingSqliteUrl.href);
+      if (typeof mod.openSqliteDb === 'function') {
+        return mod.openSqliteDb;
+      }
+    } catch {
+      // Fall through to @krusch/toolkit/sqlite or standalone CI fallback
+    }
+  }
+  try {
+    const mod = await import('@krusch/toolkit/sqlite');
+    if (typeof mod.openSqliteDb === 'function') {
+      return mod.openSqliteDb;
+    }
+  } catch {
+    // Standalone CI fallback when sibling toolkit is unavailable
+  }
+  return function standaloneOpenSqliteDb(dbPath = ':memory:', options = {}) {
+    const {
+      wal = true,
+      busyTimeout,
+      busyTimeoutMs,
+      synchronous,
+      readOnly = false,
+      foreignKeys = true
+    } = options || {};
+    const resolvedBusy = busyTimeout ?? busyTimeoutMs ?? 5000;
+    if (dbPath !== ':memory:' && !String(dbPath).startsWith('file:') && !readOnly) {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o750 });
+    }
+    const db = readOnly
+      ? Reflect.construct(NodeSqliteDriver, [dbPath, { readOnly: true }])
+      : Reflect.construct(NodeSqliteDriver, [dbPath]);
+    try {
+      const safeBusy = Number.isFinite(resolvedBusy) && resolvedBusy >= 0 ? Math.trunc(resolvedBusy) : 5000;
+      db.exec(`PRAGMA busy_timeout = ${safeBusy};`);
+      if (!readOnly) {
+        if (wal !== false) {
+          db.exec('PRAGMA journal_mode = WAL;');
+          db.exec(`PRAGMA synchronous = ${synchronous || 'NORMAL'};`);
+        } else if (synchronous) {
+          db.exec(`PRAGMA synchronous = ${synchronous};`);
+        }
+      }
+      db.exec(`PRAGMA foreign_keys = ${foreignKeys === false ? 'OFF' : 'ON'};`);
+    } catch (err) {
+      try {
+        db.close();
+      } catch {
+        // Preserve primary error
+      }
+      throw err;
+    }
+    let closed = false;
+    return {
+      db,
+      dbPath,
+      isOpen: () => !closed,
+      exec: (sql) => db.exec(sql),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        db.close();
+      }
+    };
+  };
+}
+
+const openSqliteDb = await resolveOpenSqliteDb();
 
 export const PRIORITY_TIER_POINTS = { 1: 50, 2: 30, 3: 20, 4: 15, 5: 10 };
 
@@ -48,6 +121,7 @@ export class CompanionBridge {
     this.allowCloud = Boolean(config.allowCloud);
     this.skylightClient = skylightClient;
     this.db = null;
+    this._sqliteHandle = null;
     this._stmts = null;
   }
 
@@ -64,15 +138,20 @@ export class CompanionBridge {
       fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
     }
 
-    this.db = new DatabaseSync(this.companionDbPath);
+    const sqliteHandle = openSqliteDb(this.companionDbPath, {
+      wal: true,
+      busyTimeout: 5000,
+      busyTimeoutMs: 5000,
+      synchronous: 'NORMAL',
+      foreignKeys: true
+    });
+    this._sqliteHandle = sqliteHandle;
+    this.db = sqliteHandle.db;
     try {
       fs.chmodSync(this.companionDbPath, 0o640);
     } catch (err) {
       logConnectorDebug('_getDb:chmod', err);
     }
-    this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA busy_timeout = 5000;');
-    this.db.exec('PRAGMA synchronous = NORMAL;');
 
     // Ensure core Companion tables exist if running standalone against a fresh DB
     this.db.exec(`
@@ -876,12 +955,17 @@ export class CompanionBridge {
   }
 
   async close() {
-    if (this.db) {
+    if (this._sqliteHandle || this.db) {
       try {
-        this.db.close();
+        if (this._sqliteHandle) {
+          this._sqliteHandle.close();
+        } else if (this.db) {
+          this.db.close();
+        }
       } catch (err) {
         logConnectorDebug('close', err);
       }
+      this._sqliteHandle = null;
       this.db = null;
       this._stmts = null;
     }
